@@ -1,5 +1,5 @@
 import type { DetectedSection } from "./types";
-import { SECTION_DEFS, buildExcerptBundle, classifyStatus } from "./sections";
+import { SECTION_DEFS, buildExcerptBundle, classifyStatus, findRegulatoryEvidence, formatRegulatoryEvidence } from "./sections";
 import { callLlmJson } from "./llm";
 
 // Output budget for the combined structured response (checklist + red
@@ -32,18 +32,21 @@ export interface LlmAnalysis {
 // off". Each one must be answered "not_determinable" rather than guessed
 // if the excerpts don't state it.
 const REGULATORY_CHECKS = `
-- "baseline_recency": MoEFCC's 2022 directive requires baseline environmental data (air/water/noise monitoring) to be no older than 3 years at submission. Look for stated monitoring dates/seasons. concern if data is dated and appears older than 3 years, or if no monitoring date is stated at all despite baseline figures being presented as current; pass if a monitoring period within 3 years is explicitly stated; not_determinable if baseline data isn't discussed in the excerpts.
-- "greenbelt_norm": Projects must generally commit to greenbelt/green cover of around 33% of plot area (higher, often 40%, inside Critically Polluted Areas). Regulators only count plantation on "mother earth" (ground-level soil): potted plants, rooftop/podium greenery and grass pavers do NOT count. concern if a stated greenbelt % falls short of a plausible norm for the project type, or if the report doesn't clarify whether the claimed green area is ground-level; pass if a ground-level percentage meeting a reasonable norm is explicitly stated; not_determinable if greenbelt isn't discussed.
-- "zld_consistency": "Zero Liquid Discharge" (ZLD) specifically means treated effluent is recycled/reused back into the process or utilities, not merely "no effluent leaves the premises". concern if the report claims ZLD but describes effluent being disposed of within the premises without describing it being recycled into process/utility use, or the described treatment train (ETP/RO/MEE) doesn't obviously close the loop; pass if the report explicitly describes treated water being recycled into process/scrubber/utility use; not_determinable if ZLD or effluent handling isn't discussed.
-- "cems_status": Continuous Emission Monitoring Systems (CEMS) are commonly required for Category A industrial/process stacks. concern if CEMS is mentioned as "proposed" or "to be installed" rather than confirmed installed/commissioned, for a project type where continuous stack monitoring would be expected; pass if CEMS is explicitly stated as installed and connected to CPCB/SPCB servers; not_determinable if the project type doesn't clearly need CEMS or it isn't discussed.
-- "consultant_accreditation": The EIA consultant's NABET accreditation category (A vs B1/B2) must match the project's own EC category. A Category A project needs Category A accredited Functional Area Experts. concern if the disclosure chapter doesn't state the consultant's accreditation category, or if a mismatch is evident; pass if the accreditation category is stated and appears to match the project category; not_determinable if the disclosure chapter isn't present in the excerpts.`;
+- "baseline_recency": MoEFCC's 2022 directive requires baseline environmental data (air/water/noise monitoring) to be no older than 3 years at submission. Look for stated monitoring dates/seasons. concern if data is dated and appears older than 3 years, or if no monitoring date is stated at all despite baseline figures being presented as current; pass if a monitoring period within 3 years is explicitly stated; not_determinable if baseline data isn't discussed anywhere in the excerpts or the evidence pre-scan below. If the report itself cites a specific MoEFCC office memorandum, circular, or prior EC file number to justify reusing older baseline data, treat that as the proponent's own justification: still call it "concern" if the underlying data is stale, but the finding text must name the cited justification (memorandum number/date if stated) so a reviewer can judge whether it actually applies, rather than presenting the recency gap as if the proponent never addressed it.
+- "greenbelt_norm": Projects must generally commit to greenbelt/green cover of around 33% of plot area (higher, often 40%, inside Critically Polluted Areas or Special Planning Areas). Regulators only count plantation on "mother earth" (ground-level soil): potted plants, rooftop/podium greenery and grass pavers do NOT count. concern if a stated greenbelt % falls short of a plausible norm for the project type/zone, or if the report doesn't clarify whether the claimed green area is ground-level; pass if a ground-level percentage meeting a reasonable norm is explicitly stated; not_determinable only if greenbelt genuinely isn't discussed anywhere in the excerpts or the evidence pre-scan below.
+- "zld_consistency": "Zero Liquid Discharge" (ZLD) specifically means treated effluent is recycled/reused back into the process or utilities, not merely "no effluent leaves the premises". concern if the report claims ZLD but describes effluent being disposed of within the premises without describing it being recycled into process/utility use, or the described treatment train (ETP/RO/MEE) doesn't obviously close the loop; pass if the report explicitly describes treated water being recycled into process/scrubber/utility use; not_determinable only if ZLD or effluent handling genuinely isn't discussed anywhere in the excerpts or the evidence pre-scan below.
+- "cems_status": Continuous Emission Monitoring Systems (CEMS) are commonly required for Category A industrial/process stacks. concern if CEMS is mentioned as "proposed" or "to be installed" rather than confirmed installed/commissioned, for a project type where continuous stack monitoring would be expected; pass if CEMS is explicitly stated as installed and connected to CPCB/SPCB servers; not_determinable if the project type doesn't clearly need CEMS, or it genuinely isn't discussed anywhere in the excerpts or the evidence pre-scan below.
+- "consultant_accreditation": The EIA consultant's NABET accreditation category (A vs B1/B2) must match the project's own EC category. A Category A project needs Category A accredited Functional Area Experts. concern if the disclosure chapter doesn't state the consultant's accreditation category, or if a mismatch is evident; pass if the accreditation category is stated and appears to match the project category; not_determinable only if the disclosure chapter is genuinely absent from both the excerpts and the evidence pre-scan below.
 
-function buildPrompt(sections: DetectedSection[], fileName: string) {
+IMPORTANT: a dedicated full-document keyword pre-scan for exactly these five checks is provided separately below (REGULATORY EVIDENCE PRE-SCAN), independent of which chapter excerpt it fell in or whether that chapter's excerpt was truncated. Use it as your primary evidence source for regulatoryFlags, in addition to the chapter excerpts, since the pre-scan reaches text that a chapter's excerpt cap may have cut off. Only answer "not_determinable" for a check if BOTH the relevant chapter excerpts AND the evidence pre-scan below show nothing relevant, not merely because the chapter excerpt itself was thin.`;
+
+function buildPrompt(sections: DetectedSection[], fileName: string, fullText: string, pageOffsets?: number[], totalPages?: number) {
   const heuristicTable = sections
     .map((s) => `- [${s.id}] ${s.label}: heuristic_status=${classifyStatus(s)}, chars_found=${s.charCount}`)
     .join("\n");
 
   const excerptBundle = buildExcerptBundle(sections, SECTION_DEFS);
+  const regulatoryEvidence = formatRegulatoryEvidence(findRegulatoryEvidence(fullText, pageOffsets));
 
   const system = `You are a senior environmental impact assessment (EIA) auditor working to India's EIA Notification 2006 framework. You review draft EIA reports the way an appraisal committee reviewer would: checking structural completeness, flagging vague/unsubstantiated impact claims, and separately running a fixed set of specific regulatory checks that real EAC/SEIAA committees repeatedly flag in practice (baseline data age, greenbelt norms, ZLD claims, CEMS status, consultant accreditation). You also write plain-language summaries for members of the public who are entitled to read the report before a public hearing but are not technical experts. You are careful to say "not determinable from this excerpt" rather than guess when the text doesn't state something. You always respond with strict JSON only, no markdown fences, no commentary outside the JSON object.`;
 
@@ -57,7 +60,12 @@ ${heuristicTable}
 EXCERPTS CAPTURED FROM THE REPORT (grouped by detected chapter; may be incomplete if a chapter genuinely has thin or no content):
 ${excerptBundle || "(No chapter excerpts could be located. The extracted text may be too short, scanned as an image, or structured unusually.)"}
 
+REGULATORY EVIDENCE PRE-SCAN (full-document keyword search, independent of the chapter excerpts and their length caps above; use this as your primary source for the five regulatoryFlags checks, per the instructions above):
+${regulatoryEvidence}
+
 Note: publicly available EIA reports are often NOT the full report. Companies and portals frequently publish only an Executive Summary, or a single volume (e.g. "Volume I: Main Report" without the annexures volume). Missing chapters in a genuinely partial document is expected and correct, not a report quality problem. Judge documentScope from the title page, any "Executive Summary" / "Volume" labelling, and overall length/depth of the excerpts, and say so plainly rather than letting a low completenessScore imply the underlying report itself is deficient.
+
+Do not infer documentScope from oddities in the HEURISTIC PRE-SCAN's page numbers alone (e.g. two chapters sharing a page, or a page number that looks out of order relative to its neighbours) -- that pattern usually means the automated chapter-heading detection latched onto the wrong occurrence of a repeated heading phrase elsewhere in the document, not that the underlying document is missing content or is a partial volume. Base documentScope only on explicit signals: title-page wording, "Volume"/"Part" labelling, an abrupt stop mid-topic, or the document's own stated page range/total versus${typeof totalPages === "number" && totalPages > 0 ? ` the ${totalPages}-page document actually supplied` : " the page count actually supplied"}. If the document's last tracked chapter (Disclosure of Consultants) is present with a page number reasonably close to the end of the supplied document and there is no "Volume"/"Part" labelling anywhere, that is a strong signal for full_report even if some other chapter's detected page number looks anomalous.
 
 REGULATORY PATTERN CHECKS: run exactly these five, using these specific criteria (not general impressions):
 ${REGULATORY_CHECKS}
@@ -70,7 +78,7 @@ Return a single JSON object with exactly this shape:
   "scopeNote": "<one sentence explaining the documentScope call, e.g. 'Title page labels this Volume I; annexure volume not included.'>",
   "completenessScore": <integer 0-100, weighted toward chapters that materially affect environmental clearance decisions: baseline, impacts & mitigation, EMP, risk/public consultation. If documentScope is not full_report, score completeness of what IS present relative to what this document type should contain, not against the full 11-chapter structure.>,
   "checklist": [
-    { "id": "<one of: ${SECTION_DEFS.map((d) => d.id).join(", ")}>", "status": "present"|"thin"|"missing", "note": "<one crisp sentence on what's actually there or missing, referencing specifics from the excerpt where possible>" }
+    { "id": "<one of: ${SECTION_DEFS.map((d) => d.id).join(", ")}>", "status": "present"|"thin"|"missing", "note": "<one crisp sentence on what's actually there or missing, referencing specifics from the excerpt where possible. Only say a chapter contains 'only a heading' or is otherwise near-empty if chars_found in the heuristic pre-scan above is genuinely near zero for it. If the chapter has real length but the content is boilerplate/circular (e.g. every subsection concludes 'not applicable' or 'not considered' without ever evaluating an actual option), say exactly that ('present but boilerplate: <what it circularly asserts>'), not 'only a heading' or 'missing' -- those two problems need different fixes from a submitter's point of view.>" }
   ],
   "redFlags": [
     { "section": "<chapter id or label>", "excerpt": "<the vague/unsubstantiated sentence or phrase, max ~25 words, taken from the excerpts above>", "reason": "<one sentence on why this is vague, unquantified, or boilerplate, and what evidence would fix it>" }
@@ -94,9 +102,12 @@ Rules:
 
 export async function runEiaAnalysis(
   sections: DetectedSection[],
-  fileName: string
+  fileName: string,
+  fullText: string,
+  pageOffsets?: number[],
+  totalPages?: number
 ): Promise<LlmAnalysis> {
-  const { system, user } = buildPrompt(sections, fileName);
+  const { system, user } = buildPrompt(sections, fileName, fullText, pageOffsets, totalPages);
   const parsed = await callLlmJson(system, user, MAX_OUTPUT_TOKENS);
   return normalize(parsed);
 }
