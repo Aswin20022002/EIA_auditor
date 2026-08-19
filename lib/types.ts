@@ -7,6 +7,10 @@ export interface ChecklistItem {
   status: SectionStatus;
   note: string;
   page?: number; // where this chapter's heading was located, if found
+  // True when this chapter's resolved page is wildly out of order relative
+  // to its neighbouring chapters (see flagCitationOutliers in lib/sections.ts).
+  // A structural sanity flag, not a claim the citation IS wrong.
+  citationLowConfidence?: boolean;
 }
 
 export interface RedFlag {
