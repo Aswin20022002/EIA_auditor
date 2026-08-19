@@ -18,6 +18,15 @@ export interface SectionDef {
   headingPatterns: RegExp[];
   keywords: string[];
   priority?: boolean;
+  // When true, detectSections picks the EARLIEST heading hit for this id
+  // rather than the hit that produces the largest block. Chapters whose
+  // generic name ("Introduction", "Description of Environment", etc.) gets
+  // reused verbatim as a sub-heading inside other chapters (e.g. every
+  // chapter's own "10.1 Introduction") are exactly the ones where the
+  // largest-block heuristic tends to lock onto a later, longer subsection
+  // instead of the real, earlier chapter opening. See lib/sections.ts gap
+  // analysis notes for the case this was found against.
+  preferEarliest?: boolean;
 }
 
 // Real reports number chapters inconsistently: arabic, roman numerals, or
@@ -27,7 +36,22 @@ export interface SectionDef {
 // number, since numbering position also varies between consultants.
 function headingRegex(phrase: string): RegExp {
   return new RegExp(
-    `^\\s*(?:chapter\\s*[-\u2013\u2014:]?\\s*)?(?:\\d{1,2}(?:\\.\\d{1,2})?|[ivxIVX]{1,6})?\\s*[.\\-\u2013\u2014:)]*\\s*(?:${phrase})`,
+    `^\\s*(?:chapter\\s*[-–—:]?\\s*)?(?:\\d{1,2}(?:\\.\\d{1,2})?|[ivxIVX]{1,6})?\\s*[.\\-–—:)]*\\s*(?:${phrase})`,
+    "i"
+  );
+}
+
+// Same as headingRegex, but the numeric prefix is restricted to a bare
+// top-level chapter number ("1", "10", "IV") with no ".N" subsection part.
+// Use this for chapter ids whose generic name is routinely reused as a
+// sub-heading inside OTHER chapters ("10.1 Introduction" inside the EMP
+// chapter, "2.1 Description of the Project" repeated inside itself, etc.):
+// a bare-number-only prefix can't match "10.1", so it stops that specific
+// collision at the pattern level rather than relying on block-length
+// comparison to sort it out after the fact.
+function topLevelHeadingRegex(phrase: string): RegExp {
+  return new RegExp(
+    `^\\s*(?:chapter\\s*[-–—:]?\\s*)?(?:\\d{1,2}|[ivxIVX]{1,6})?\\s*[.\\-–—:)]*\\s*(?:${phrase})`,
     "i"
   );
 }
@@ -38,11 +62,16 @@ export const SECTION_DEFS: SectionDef[] = [
     label: "Introduction & Project Background",
     clause: "Ch. 1",
     headingPatterns: [
-      headingRegex("introduction"),
+      // Top-level-only: "10.1 Introduction" inside a later chapter (a
+      // near-universal sub-heading in Indian EIA reports) must not match
+      // here, or it wins the largest-block comparison against the real,
+      // much shorter Chapter 1 opening.
+      topLevelHeadingRegex("introduction"),
       headingRegex("purpose of (?:the )?(?:eia|report|study)"),
       headingRegex("identification of (?:the )?project"),
     ],
     keywords: ["purpose of the eia", "background of the project", "identification of project", "project proponent"],
+    preferEarliest: true,
   },
   {
     id: "project_desc",
@@ -50,6 +79,7 @@ export const SECTION_DEFS: SectionDef[] = [
     clause: "Ch. 2",
     headingPatterns: [headingRegex("project description"), headingRegex("description of (?:the )?project")],
     keywords: ["project cost", "land requirement", "raw material", "manufacturing process", "installed capacity", "plant capacity"],
+    preferEarliest: true,
   },
   {
     id: "baseline",
@@ -64,6 +94,7 @@ export const SECTION_DEFS: SectionDef[] = [
     ],
     keywords: ["ambient air quality", "ground water quality", "noise level monitoring", "soil characteristics", "flora and fauna", "study area"],
     priority: true,
+    preferEarliest: true,
   },
   {
     id: "impacts",
@@ -114,9 +145,23 @@ export const SECTION_DEFS: SectionDef[] = [
     keywords: ["employment generation", "socio-economic benefit", "infrastructure development", "corporate social responsibility"],
   },
   {
+    // Previously missing from SECTION_DEFS entirely: the generic EIA
+    // Notification 2006 structure has 12 chapters, this file only tracked
+    // 11, and this was the untracked one. It wasn't reported missing or
+    // thin, it simply never appeared anywhere in the dashboard output.
+    id: "cost_benefit",
+    label: "Environmental Cost Benefit Analysis",
+    clause: "Ch. 9",
+    headingPatterns: [
+      headingRegex("environmental (?:cost[- ]benefit|cost benefit) analysis"),
+      headingRegex("cost benefit analysis"),
+    ],
+    keywords: ["cost benefit analysis", "environmental cost", "economic valuation of environmental", "shadow price"],
+  },
+  {
     id: "emp",
     label: "Environmental Management Plan (EMP)",
-    clause: "Ch. 9",
+    clause: "Ch. 10",
     headingPatterns: [headingRegex("environmental management plan"), headingRegex("emp\\b.{0,25}(?:budget|cost|implementation|cell)")],
     keywords: ["emp budget", "environmental management cell", "implementation schedule", "capital cost"],
     priority: true,
@@ -124,7 +169,7 @@ export const SECTION_DEFS: SectionDef[] = [
   {
     id: "summary",
     label: "Summary & Conclusion",
-    clause: "Ch. 10",
+    clause: "Ch. 11",
     headingPatterns: [
       headingRegex("summary (?:and|&) conclusion"),
       headingRegex("summary of (?:the )?(?:eia|findings|project)"),
@@ -135,7 +180,7 @@ export const SECTION_DEFS: SectionDef[] = [
   {
     id: "disclosure",
     label: "Disclosure of Consultants",
-    clause: "Ch. 11",
+    clause: "Ch. 12",
     headingPatterns: [
       headingRegex("disclosure of consultants?"),
       headingRegex("accredited consultant"),
@@ -164,8 +209,7 @@ const LAST_SECTION_FALLBACK_CHARS = 20_000;
  * since detection takes the *first* match, it was locking onto the ToC
  * entry, an isolated line with a page number, instead of the real chapter,
  * making that chapter look empty no matter how much content it actually
- * has. Filtering ToC lines out of the candidate hits, rather than trying to
- * special-case the block-building step, fixes this at the source: the
+ * has. Filtering ToC lines out of heading detection for the same reason: a
  * *first* remaining match is then the real heading.
  *
  * Deliberately conservative: real chapter headings essentially never end in
@@ -184,176 +228,35 @@ function isTableOfContentsLine(line: string): boolean {
   return dotCount >= 2 || tabCount >= 1 || spaceCount >= 3;
 }
 
-function findHeadingHits(text: string, defs: SectionDef[]) {
-  const lines = text.split(/\n/);
-  const hits: { id: string; lineIndex: number; charIndex: number }[] = [];
-  let charIndex = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!isTableOfContentsLine(line)) {
-      for (const def of defs) {
-        if (def.headingPatterns.some((re) => re.test(line))) {
-          hits.push({ id: def.id, lineIndex: i, charIndex });
-          break;
-        }
-      }
-    }
-    charIndex += line.length + 1;
-  }
-  return hits;
-}
-
-/** Converts a character offset into a 1-indexed page number, given the
- * pageOffsets array produced during client-side extraction. Binary search
- * would be overkill here since reports rarely exceed a few thousand pages. */
-export function charIndexToPage(pageOffsets: number[] | undefined, charIndex: number): number | undefined {
-  if (!pageOffsets || pageOffsets.length === 0) return undefined;
-  let page = 1;
-  for (let i = 0; i < pageOffsets.length; i++) {
-    if (pageOffsets[i] <= charIndex) page = i + 1;
-    else break;
-  }
-  return page;
-}
-
-/** Locates a short excerpt (as returned by the LLM) within the original
- * text and resolves it to a page number. This is deliberately done in code
- * against the real source text, not trusted from the model's own output.
- * An LLM citing its own page number is exactly the kind of ungrounded
- * claim this whole app exists to catch in other people's documents. */
-export function findExcerptPage(fullText: string, excerpt: string, pageOffsets: number[] | undefined): number | undefined {
-  if (!excerpt || !pageOffsets) return undefined;
-  // Try the excerpt as-is, then a shortened prefix (the model sometimes
-  // trims trailing punctuation/whitespace differently than the source).
-  const candidates = [excerpt, excerpt.slice(0, Math.max(20, Math.floor(excerpt.length * 0.7)))];
-  for (const c of candidates) {
-    const idx = fullText.toLowerCase().indexOf(c.toLowerCase().trim());
-    if (idx >= 0) return charIndexToPage(pageOffsets, idx);
-  }
-  return undefined;
-}
-
-export function detectSections(fullText: string, pageOffsets?: number[]): DetectedSection[] {
-  const hits = findHeadingHits(fullText, SECTION_DEFS);
-  const results: DetectedSection[] = [];
-
-  const sortedHits = [...hits].sort((a, b) => a.charIndex - b.charIndex);
-
-  for (const def of SECTION_DEFS) {
-    const candidates = sortedHits.filter((h) => h.id === def.id);
-
-    let best: { hit: (typeof candidates)[0]; block: string } | null = null;
-    for (const hit of candidates) {
-      // Block runs until the next heading hit of any section (by char index).
-      const nextHit = sortedHits.find((h) => h.charIndex > hit.charIndex);
-      const end = nextHit ? nextHit.charIndex : Math.min(fullText.length, hit.charIndex + LAST_SECTION_FALLBACK_CHARS);
-      const block = fullText.slice(hit.charIndex, end).trim();
-      if (!best || block.length > best.block.length) best = { hit, block };
-    }
-
-    if (best) {
-      results.push({
-        id: def.id,
-        label: def.label,
-        found: best.block.length >= MIN_CHARS_THIN,
-        excerpt: best.block.slice(0, EXCERPT_CHARS),
-        charCount: best.block.length,
-        page: charIndexToPage(pageOffsets, best.hit.charIndex),
-      });
-      continue;
-    }
-
-    // Fallback: no dedicated heading found. Check keyword density anywhere.
-    const lower = fullText.toLowerCase();
-    let keywordHits = 0;
-    let firstIdx = -1;
-    for (const kw of def.keywords) {
-      const re = new RegExp(kw, "i");
-      const m = lower.match(re);
-      if (m && m.index !== undefined) {
-        keywordHits++;
-        if (firstIdx === -1) firstIdx = m.index;
-      }
-    }
-
-    if (keywordHits > 0 && firstIdx >= 0) {
-      const excerpt = fullText.slice(firstIdx, firstIdx + EXCERPT_CHARS).trim();
-      results.push({
-        id: def.id,
-        label: def.label,
-        found: false, // no dedicated chapter, scattered mentions only
-        excerpt,
-        charCount: excerpt.length,
-        page: charIndexToPage(pageOffsets, firstIdx),
-      });
-    } else {
-      results.push({ id: def.id, label: def.label, found: false, excerpt: "", charCount: 0 });
-    }
-  }
-
-  return results;
-}
-
-export function classifyStatus(section: DetectedSection): "present" | "thin" | "missing" {
-  if (section.charCount >= MIN_CHARS_PRESENT && section.found) return "present";
-  if (section.charCount >= MIN_CHARS_THIN) return "thin";
-  return "missing";
-}
-
-/** Build the excerpt bundle sent to the LLM, capped to a token-friendly budget. */
 /**
- * Broad-coverage variant used for ToR matching: a ToR clause can point at
- * almost any chapter (green belt details might be in Project Description
- * or the EMP; rainwater harvesting might be either), so this favours
- * touching every detected chapter with a shorter excerpt over going deep
- * on a priority few.
+ * True for a "Structure of the Report" preview-list line, e.g.:
+ *   "Chapter 10- Environmental Management Plan: This is the key Chapter..."
+ *   "Chapter 12 – Disclosure of Consultants engaged: Names of consultants..."
+ * A one-paragraph section near the start of nearly every Indian
+ * consultant-authored EIA report previews every later chapter title in one
+ * clause each, introduced by a colon. Unlike a dotted ToC line (already
+ * filtered above), this doesn't end in a bare page number, it's a full
+ * sentence, so it needs its own filter. Without it, a chapter's own heading
+ * pattern matches this preview clause just as well as the real heading
+ * hundreds of pages later, and since the preview sentence sits inside a
+ * long descriptive paragraph, it can end up producing a longer captured
+ * block than the real, terser chapter heading, winning the block-length
+ * comparison in detectSections() outright.
+ *
+ * Deliberately requires BOTH the "Chapter N -" prefix AND a colon-introduced
+ * gloss after the title, since a real standalone chapter heading is a short
+ * line ending at (or near) the title, not a title immediately followed by
+ * ": <explanatory sentence>" on the same line.
  */
-export function buildBroadExcerptBundle(sections: DetectedSection[]) {
-  // Widened now that Gemini's free tier gives a ~1M-token context window
-  // (versus the ~8k-token/minute ceiling the previous Groq free model
-  // imposed). This budget was the direct cause of most "not_addressed"
-  // false negatives in ToR matching: a clause genuinely covered in the
-  // report scored as unaddressed simply because the chapter that covered
-  // it had been cut down to ~650 characters before the model ever saw it.
-  const CHAR_BUDGET = 30_000;
-  const CAP_PER_SECTION = 2800;
-  let used = 0;
-  const parts: string[] = [];
-
-  for (const s of sections) {
-    if (!s.excerpt) continue;
-    const chunk = s.excerpt.slice(0, CAP_PER_SECTION);
-    if (used + chunk.length > CHAR_BUDGET) continue;
-    used += chunk.length;
-    parts.push(`### [${s.id}] ${s.label}\n${chunk}`);
-  }
-  return parts.join("\n\n");
+function isChapterPreviewLine(lines: string[], i: number): boolean {
+  const line = lines[i].trim();
+  if (!/^chapter\s*\d{1,2}\s*[-–—]\s*\S/i.test(line)) return false;
+  // The colon-introduced gloss that marks this as a preview-list entry
+  // rather than a real heading may itself wrap onto the next line or two
+  // depending on how the PDF extractor broke the paragraph, so check a
+  // short lookahead window rather than only the current line.
+  const window = [line, lines[i + 1] || "", lines[i + 2] || ""].join(" ").trim();
+  return /^chapter\s*\d{1,2}\s*[-–—]\s*[^:]{3,120}:\s*\S/i.test(window);
 }
 
-export function buildExcerptBundle(sections: DetectedSection[], defs = SECTION_DEFS) {
-  // Widened alongside buildBroadExcerptBundle above, same reasoning: the
-  // old ~11k-character budget (~3.5-4k tokens) was sized for Groq's free
-  // rate limit, not for actually giving the model enough of each chapter
-  // to judge it accurately. ~45k characters is still a small fraction of
-  // Gemini 2.5 Flash's context window.
-  const CHAR_BUDGET = 45_000;
-  let used = 0;
-  const parts: string[] = [];
-
-  const ordered = [...sections].sort((a, b) => {
-    const da = defs.find((d) => d.id === a.id)?.priority ? 0 : 1;
-    const db = defs.find((d) => d.id === b.id)?.priority ? 0 : 1;
-    return da - db;
-  });
-
-  for (const s of ordered) {
-    if (!s.excerpt) continue;
-    const def = defs.find((d) => d.id === s.id);
-    const cap = def?.priority ? 6000 : 2200;
-    const chunk = s.excerpt.slice(0, cap);
-    if (used + chunk.length > CHAR_BUDGET) continue;
-    used += chunk.length;
-    parts.push(`### [${s.id}] ${s.label}\n${chunk}`);
-  }
-  return parts.join("\n\n");
-}
+fu
