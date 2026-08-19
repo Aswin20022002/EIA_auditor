@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { detectSections, classifyStatus, findExcerptPage, SECTION_DEFS } from "@/lib/sections";
+import { detectSections, classifyStatus, findExcerptPage, flagCitationOutliers, SECTION_DEFS } from "@/lib/sections";
 import { runEiaAnalysis } from "@/lib/eia-analysis";
 import { computeVerdict } from "@/lib/verdict";
-import type { AnalysisResult } from "@/lib/types";
+import type { AnalysisResult, ChecklistItem } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const maxDuration = 60; // requires Vercel Hobby function config to allow up to 60s
@@ -36,13 +36,16 @@ export async function POST(req: NextRequest) {
 
     const textForScan = text.length > MAX_CHARS ? text.slice(0, MAX_CHARS) : text;
     const detected = detectSections(textForScan, pageOffsets);
-    const llm = await runEiaAnalysis(detected, fileName);
+    // fullText/pageOffsets passed through so the regulatory-check evidence
+    // pre-scan can search the whole document, not just the per-chapter
+    // excerpt bundle (see findRegulatoryEvidence in lib/sections.ts).
+    const llm = await runEiaAnalysis(detected, fileName, textForScan, pageOffsets, totalPages);
 
     // Merge heuristic + LLM checklist so every section always has an entry,
     // even if the model dropped one. Page numbers come from where the
     // heuristic scan actually located the heading, computed in code
     // against the real text, not trusted from the model's own output.
-    const checklist = SECTION_DEFS.map((def) => {
+    const checklist: ChecklistItem[] = SECTION_DEFS.map((def) => {
       const fromLlm = llm.checklist.find((c) => c.id === def.id);
       const fallback = detected.find((d) => d.id === def.id);
       return {
@@ -54,6 +57,17 @@ export async function POST(req: NextRequest) {
         page: fallback?.page,
       };
     });
+
+    // Cheap structural sanity check, not a substitute for the detection
+    // fixes above: flags a resolved page number that's wildly out of order
+    // relative to its neighbouring chapters (e.g. EMP resolving to page 51
+    // while Baseline resolves to page 367), so a wrong citation doesn't sit
+    // at full visual confidence in the dashboard while those fixes get
+    // validated against more real reports.
+    const lowConfidenceIds = flagCitationOutliers(checklist);
+    for (const item of checklist) {
+      if (lowConfidenceIds.has(item.id)) item.citationLowConfidence = true;
+    }
 
     const redFlags = llm.redFlags.map((f) => ({
       ...f,
