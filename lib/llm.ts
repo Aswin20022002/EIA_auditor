@@ -5,12 +5,12 @@
  * app (lib/eia-analysis.ts, lib/tor.ts) never touches a provider SDK or
  * API shape directly.
  *
- * Why Gemini as the default: Gemini 2.5 Flash's free tier gives a ~1M
- * token context window, which is what actually lets this app send full,
- * generous excerpts per chapter instead of the ~8k-token/minute ceiling
- * the previous Groq free-tier model imposed. That headroom is what fixed
- * the "only 2 of 18 ToR clauses addressed" false-negative problem: most
- * of those were the model genuinely not being shown enough text, not the
+ * Why Gemini as the default: Gemini's free tier gives a ~1M token context
+ * window, which is what actually lets this app send full, generous
+ * excerpts per chapter instead of the ~8k-token/minute ceiling the
+ * previous Groq free-tier model imposed. That headroom is what fixed the
+ * "only 2 of 18 ToR clauses addressed" false-negative problem: most of
+ * those were the model genuinely not being shown enough text, not the
  * model being wrong.
  *
  * Why Groq stays supported: Google has tightened Gemini's free daily
@@ -18,6 +18,15 @@
  * limit or server error on Gemini automatically retries on Groq for that
  * one call, so a demo doesn't die mid-session because of a quota reset
  * neither of us controls. Set LLM_PROVIDER=groq to prefer Groq instead.
+ *
+ * Gemini 3.x note: the Gemini 3 model family (which gemini-3.6-flash
+ * belongs to) replaced the old thinkingBudget field with thinkingLevel,
+ * and Flash-tier Gemini 3 models cannot fully disable thinking the way
+ * gemini-2.5-flash could with thinkingBudget: 0 — "low" is the minimum.
+ * temperature/top_p/top_k are also deprecated across the whole Gemini 3.x
+ * line (currently silently ignored, but Google has said a future version
+ * may reject them outright), so they're left out entirely rather than
+ * carried over from the 2.5-era request shape.
  */
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
@@ -62,16 +71,15 @@ async function callGemini(system: string, user: string, maxTokens: number): Prom
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ role: "user", parts: [{ text: user }] }],
       generationConfig: {
-        temperature: 0.2,
         maxOutputTokens: maxTokens,
         responseMimeType: "application/json",
-        // This task is structured extraction against text we hand it, not
-        // open-ended reasoning, so extended thinking buys nothing. It also
-        // has a sharp failure mode on Flash: thinking tokens are drawn from
-        // the same maxOutputTokens budget, so if left on, a long analysis
-        // can silently burn the whole budget on thinking and return an
-        // empty response instead of the JSON we asked for.
-        thinkingConfig: { thinkingBudget: 0 },
+        // "low" is the minimum thinking level Gemini 3 Flash models
+        // support — they can't fully disable thinking the way
+        // gemini-2.5-flash could with thinkingBudget: 0. Thinking tokens
+        // still draw from maxOutputTokens, so if a long analysis starts
+        // returning empty responses with finishReason MAX_TOKENS, raise
+        // maxTokens to leave headroom for the unavoidable thinking cost.
+        thinkingConfig: { thinkingLevel: "low" },
       },
     }),
   });
