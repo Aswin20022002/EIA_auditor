@@ -33,6 +33,14 @@ export default function ChecklistPanel({ checklist }: { checklist: ChecklistItem
                       Page {item.page}
                     </span>
                   )}
+                  {item.citationLowConfidence && (
+                    <span
+                      title="This page number is out of order relative to neighbouring chapters and may be a mis-detected heading. Worth checking against the source document."
+                      className="text-sm font-medium text-brick bg-brick/10 border border-brick/20 rounded px-2 py-0.5"
+                    >
+                      Unverified citation
+                    </span>
+                  )}
                 </div>
                 {item.note && <p className="text-base text-muted mt-1.5">{item.note}</p>}
               </div>
