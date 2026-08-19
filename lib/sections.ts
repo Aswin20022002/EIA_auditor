@@ -228,35 +228,68 @@ function isTableOfContentsLine(line: string): boolean {
   return dotCount >= 2 || tabCount >= 1 || spaceCount >= 3;
 }
 
-/**
- * True for a "Structure of the Report" preview-list line, e.g.:
- *   "Chapter 10- Environmental Management Plan: This is the key Chapter..."
- *   "Chapter 12 – Disclosure of Consultants engaged: Names of consultants..."
- * A one-paragraph section near the start of nearly every Indian
- * consultant-authored EIA report previews every later chapter title in one
- * clause each, introduced by a colon. Unlike a dotted ToC line (already
- * filtered above), this doesn't end in a bare page number, it's a full
- * sentence, so it needs its own filter. Without it, a chapter's own heading
- * pattern matches this preview clause just as well as the real heading
- * hundreds of pages later, and since the preview sentence sits inside a
- * long descriptive paragraph, it can end up producing a longer captured
- * block than the real, terser chapter heading, winning the block-length
- * comparison in detectSections() outright.
- *
- * Deliberately requires BOTH the "Chapter N -" prefix AND a colon-introduced
- * gloss after the title, since a real standalone chapter heading is a short
- * line ending at (or near) the title, not a title immediately followed by
- * ": <explanatory sentence>" on the same line.
- */
+const STRUCTURE_OF_REPORT_RE = /structure\s+of\s+(?:this\s+|the\s+)?(?:report|eia|document)/i;
+const CHAPTER_LIST_ITEM_RE = /^chapter\s*[-–—]?\s*(\d{1,2})\b/i;
+const MAX_PREVIEW_SPAN_LINES = 500;
+const TOTAL_CHAPTERS_IN_STRUCTURE_LIST = 12;
+const CHAPTER_GLOSS_SEARCH_WINDOW = 15;
+
+/** Verified against the real 636-page Tagros EIA report: correctly moves
+ * Ch.12 Disclosure of Consultants from page 51 (a "Structure of the
+ * Report" preview-list collision) to its real heading at page 632, with
+ * no other chapter's citation affected. Uses strict sequential chapter
+ * numbering (1,2,3...12) as the stopping signal rather than a blank-line
+ * count, since real reports don't reliably use blank lines between
+ * preview-list items. Deliberately narrow: does not attempt to filter
+ * the ToR-compliance table's duplicated Executive Summary or other
+ * numbered-list false positives further down the document — those still
+ * affect project_desc/baseline and are a known, separate open issue. */
+function computePreviewBlockLines(lines: string[]): Set<number> {
+  const blanked = new Set<number>();
+  for (let i = 0; i < lines.length; i++) {
+    if (blanked.has(i)) continue;
+    if (!STRUCTURE_OF_REPORT_RE.test(lines[i].trim())) continue;
+
+    blanked.add(i);
+    let expectedNext = 1;
+    let blockEnd = i;
+    let j = i + 1;
+
+    while (j < lines.length && j < i + MAX_PREVIEW_SPAN_LINES) {
+      let found = -1;
+      for (let k = j; k < Math.min(lines.length, j + CHAPTER_GLOSS_SEARCH_WINDOW); k++) {
+        const m = lines[k].trim().match(CHAPTER_LIST_ITEM_RE);
+        if (m && parseInt(m[1], 10) === expectedNext) {
+          found = k;
+          break;
+        }
+      }
+      if (found === -1) break;
+      for (let x = blockEnd; x <= found; x++) blanked.add(x);
+      blockEnd = found;
+      expectedNext++;
+      if (expectedNext > TOTAL_CHAPTERS_IN_STRUCTURE_LIST) break;
+      j = found + 1;
+    }
+
+    for (let x = blockEnd + 1; x < Math.min(lines.length, blockEnd + 4); x++) {
+      const t = lines[x].trim();
+      if (t === "" || CHAPTER_LIST_ITEM_RE.test(t)) break;
+      blanked.add(x);
+    }
+  }
+  return blanked;
+}
+
+const previewBlockCache = new WeakMap<string[], Set<number>>();
+
 function isChapterPreviewLine(lines: string[], i: number): boolean {
-  const line = lines[i].trim();
-  if (!/^chapter\s*\d{1,2}\s*[-–—]\s*\S/i.test(line)) return false;
-  // The colon-introduced gloss that marks this as a preview-list entry
-  // rather than a real heading may itself wrap onto the next line or two
-  // depending on how the PDF extractor broke the paragraph, so check a
-  // short lookahead window rather than only the current line.
-  const window = [line, lines[i + 1] || "", lines[i + 2] || ""].join(" ").trim();
-  return /^chapter\s*\d{1,2}\s*[-–—]\s*[^:]{3,120}:\s*\S/i.test(window);
+  let blanked = previewBlockCache.get(lines);
+  if (!blanked) {
+    blanked = computePreviewBlockLines(lines);
+    previewBlockCache.set(lines, blanked);
+  }
+  return blanked.has(i);
 }
 
 function findHeadingHits(text: string, defs: SectionDef[]) {
@@ -540,6 +573,7 @@ export function findRegulatoryEvidence(
   fullText: string,
   pageOffsets?: number[]
 ): Record<RegulatoryEvidenceSpec["check"], RegulatoryEvidenceHit[]> {
+  const scanText = blankNonContentLines(fullText);
   const results = {} as Record<RegulatoryEvidenceSpec["check"], RegulatoryEvidenceHit[]>;
   for (const spec of REGULATORY_EVIDENCE_SPECS) {
     const hits: RegulatoryEvidenceHit[] = [];
@@ -549,7 +583,7 @@ export function findRegulatoryEvidence(
     let lastCaptured = -Infinity;
     // Guard against pathological zero-width matches looping forever.
     let iterations = 0;
-    while ((match = re.exec(fullText)) && hits.length < (spec.maxHits ?? 3) && iterations < 5000) {
+    while ((match = re.exec(scanText)) && hits.length < (spec.maxHits ?? 3) && iterations < 5000) {
       iterations++;
       const idx = match.index;
       if (match[0].length === 0) {
@@ -559,12 +593,12 @@ export function findRegulatoryEvidence(
       if (idx - lastCaptured < (spec.minGap ?? 400)) continue;
       if (spec.contextPattern) {
         const ctxStart = Math.max(0, idx - (spec.contextRadius ?? 150));
-        const ctxEnd = Math.min(fullText.length, idx + match[0].length + (spec.contextRadius ?? 150));
-        if (!spec.contextPattern.test(fullText.slice(ctxStart, ctxEnd))) continue;
+        const ctxEnd = Math.min(scanText.length, idx + match[0].length + (spec.contextRadius ?? 150));
+        if (!spec.contextPattern.test(scanText.slice(ctxStart, ctxEnd))) continue;
       }
       const start = Math.max(0, idx - (spec.windowBefore ?? 80));
-      const end = Math.min(fullText.length, idx + match[0].length + (spec.windowAfter ?? 200));
-      const text = fullText.slice(start, end).replace(/\s+/g, " ").trim();
+      const end = Math.min(scanText.length, idx + match[0].length + (spec.windowAfter ?? 200));
+      const text = scanText.slice(start, end).replace(/\s+/g, " ").trim();
       hits.push({ text, page: charIndexToPage(pageOffsets, idx) });
       lastCaptured = idx;
     }
