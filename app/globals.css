@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  ::selection {
+    background-color: #1f5e56;
+    color: #eaede7;
+  }
+
+  * {
+    scrollbar-color: #1f5e56 #eaede7;
+  }
+}
+
+@layer utilities {
+  .label-caps {
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .focus-ring:focus-visible {
+    outline: 2px solid #1f5e56;
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+  }
+  .print-area {
+    color: #000;
+  }
+}
